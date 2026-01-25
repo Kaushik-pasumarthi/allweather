@@ -2,3 +2,5 @@
 /dataset/
 /masked_baseline/mask_vis/
 masked_baseline/latest.pth
+/pretrain_tw/
+/masked_baseline/
