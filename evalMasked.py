@@ -1,40 +1,64 @@
-import time
 import torch
-import lpips
 import numpy as np
 from torch.utils.data import DataLoader
-
-from utils import validation
 from train_data_functions import AllWeatherDataset
+
+from transweather_model import Transweather          # original model file
 from transweather_masked import MaskedResidualTransWeather, MaskNet
 
-# ------------------ Device ------------------
+# ----------------------------------------------------
+# masked PSNR
+# ----------------------------------------------------
+def masked_psnr(pred, gt, mask, eps=1e-8):
+    # pred, gt : [B,3,H,W] in [0,1]
+    # mask     : [B,1,H,W]   (soft mask allowed)
+
+    diff2 = (pred - gt) ** 2
+
+    # broadcast mask to RGB
+    mask = mask.expand_as(diff2)
+
+    mse = (diff2 * mask).sum() / (mask.sum() * 1.0 + eps)
+
+    psnr = 10.0 * torch.log10(1.0 / mse)
+    return psnr
+
+
+# ----------------------------------------------------
+# main
+# ----------------------------------------------------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("Using device:", device)
 
-class MaskedWrapper(torch.nn.Module):
-    def __init__(self, masked_model):
-        super().__init__()
-        self.masked_model = masked_model
+# ---------------- models ----------------
 
-    def forward(self, x):
-        out, _ = self.masked_model(x)
-        return out
-
-
-# ------------------ Load model ------------------
+# MaskNet (trained)
 mask_net = MaskNet().to(device)
-model = MaskedResidualTransWeather(mask_net).to(device)
 
-state = torch.load("masked_baseline/latest.pth", map_location=device)
-model.load_state_dict(state, strict=False)
-model.eval()
+# masked model
+masked_model = MaskedResidualTransWeather(mask_net).to(device)
 
-# ------------------ Validation dataset ------------------
+# baseline TransWeather
+base_model = Transweather().to(device)
+
+# ---------------- load checkpoints ----------------
+
+masked_ckpt = torch.load("masked_baseline/latest.pth", map_location=device)
+masked_model.load_state_dict(masked_ckpt, strict=False)
+
+base_ckpt = torch.load("pretrain_tw/best", map_location=device)
+base_model.load_state_dict(base_ckpt, strict=False)
+#base_model.load(base_ckpt) if hasattr(base_model, "load") else base_model.load_state_dict(base_ckpt, strict=False)
+
+masked_model.eval()
+base_model.eval()
+mask_net.eval()
+
+# ---------------- data ----------------
+
 val_dataset = AllWeatherDataset(
     root="dataset",
     file_list="dataset/val.txt",
-    crop_size=[192, 192],
+    crop_size=[192,192],
     train=False
 )
 
@@ -45,68 +69,46 @@ val_loader = DataLoader(
     num_workers=0
 )
 
-# ------------------ LPIPS ------------------
-lpips_fn = lpips.LPIPS(net="alex").to(device)
-lpips_fn.eval()
+# ---------------- loop ----------------
 
-# ------------------ Metrics ------------------
-lpips_scores = []
-inference_times = []
+masked_psnr_base = []
+masked_psnr_masked = []
 mask_means = []
 
-torch.set_grad_enabled(False)
+with torch.no_grad():
 
-# ------------------ Run evaluation ------------------
-for idx, batch in enumerate(val_loader):
-    inp, gt, _ = batch
-    inp = inp.to(device)
-    gt = gt.to(device)
+    for i, batch in enumerate(val_loader):
 
-    # -------- Timing --------
-    torch.cuda.synchronize()
-    start = time.time()
+        inp, gt, _ = batch
+        inp = inp.to(device)
+        gt  = gt.to(device)
 
-    pred, mask = model(inp)
+        # ----- masked model -----
+        pred_masked, mask = masked_model(inp)
 
-    torch.cuda.synchronize()
-    end = time.time()
+        # make sure mask is pixel mask
+        # (many of your MaskNet versions output 1xHxW already)
+        if mask.ndim == 2:
+            raise RuntimeError("Mask must be spatial (B,1,H,W), not patch vector")
 
-    inference_times.append(end - start)
-    mask_means.append(mask.mean().item())
+        # ----- baseline model -----
+        pred_base = base_model(inp)
 
-    # -------- LPIPS --------
-    # LPIPS expects [-1, 1]
-    lp = lpips_fn(
-        2 * pred - 1,
-        2 * gt - 1
-    )
-    lpips_scores.append(lp.item())
+        # ----- masked PSNRs -----
+        psnr_m = masked_psnr(pred_masked, gt, mask)
+        psnr_b = masked_psnr(pred_base,   gt, mask)
 
-    if idx % 50 == 0:
-        print(f"Evaluated {idx}/{len(val_loader)} images")
+        masked_psnr_masked.append(psnr_m.item())
+        masked_psnr_base.append(psnr_b.item())
+        mask_means.append(mask.mean().item())
 
-# ------------------ PSNR & SSIM ------------------
-wrapped_model = MaskedWrapper(model)
+        if i % 50 == 0:
+            print(f"{i}/{len(val_loader)}")
 
-psnr, ssim = validation(
-    wrapped_model,
-    val_loader,
-    device,
-    exp_name="masked_transweather"
-)
+# ---------------- results ----------------
 
-
-# ------------------ Efficiency ------------------
-avg_time = np.mean(inference_times)
-fps = 1.0 / avg_time
-
-# ------------------ Results ------------------
-print("\n====== Masked TransWeather Results ======")
-print(f"PSNR  : {psnr:.2f} dB")
-print(f"SSIM  : {ssim:.4f}")
-print(f"LPIPS : {np.mean(lpips_scores):.4f}")
-print("----------------------------------------")
-print(f"Avg inference time : {avg_time * 1000:.2f} ms/image")
-print(f"FPS                : {fps:.2f}")
-print(f"Mean mask value    : {np.mean(mask_means):.4f}")
-print("========================================\n")
+print("\n=========== MASKED REGION COMPARISON ===========")
+print(f"Masked PSNR (TransWeather)        : {np.mean(masked_psnr_base):.2f} dB")
+print(f"Masked PSNR (Masked TransWeather) : {np.mean(masked_psnr_masked):.2f} dB")
+print(f"Mean mask value                   : {np.mean(mask_means):.4f}")
+print("===============================================\n")

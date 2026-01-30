@@ -4,3 +4,5 @@
 masked_baseline/latest.pth
 /pretrain_tw/
 /masked_baseline/
+/base_transweather_5ep/best
+/base_transweather_5ep/latest
