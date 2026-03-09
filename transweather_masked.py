@@ -849,37 +849,185 @@ class Transweather(nn.Module):
         torch.cuda.empty_cache()
 
 
+# class MaskedResidualTransWeather(nn.Module):
+#     """
+#     Selective dehazing via dynamic cropping.
+#     1. Predicts object mask.
+#     2. Crops to bounding box + padding.
+#     3. Runs TransWeather ONLY on the crop.
+#     4. Pastes the restored crop back into the full image.
+#     """
+#
+#     def __init__(self, mask_net):
+#         super().__init__()
+#         self.mask_net = mask_net  # Lightweight U-Net
+#         self.dehazer = Transweather()  # Expects 4-channel input (Image + Mask)
+#
+#     def forward(self, x):
+#         B, C, H, W = x.shape
+#
+#         # 1. Predict mask
+#         mask = self.mask_net(x)  # [B, 1, H, W]
+#
+#         # We can safely go back to 0.5 because our new cropping logic is noise-resistant
+#         binary_mask = (mask > 0.5).float()
+#
+#         # --- THE PRO FIX: AXIS PROJECTION ---
+#         # Sum the active pixels across rows (dim=1) and columns (dim=0)
+#         row_sums = torch.sum(binary_mask[0, 0], dim=1)  # Shape: [H]
+#         col_sums = torch.sum(binary_mask[0, 0], dim=0)  # Shape: [W]
+#
+#         # Ignore rows/cols that only have a tiny amount of noise.
+#         # This completely stops one stray pixel in the corner from ruining the crop.
+#         noise_threshold = 10
+#         valid_rows = torch.nonzero(row_sums > noise_threshold, as_tuple=False)
+#         valid_cols = torch.nonzero(col_sums > noise_threshold, as_tuple=False)
+#
+#         # If nothing meaningful is found, return the original image
+#         if valid_rows.numel() == 0 or valid_cols.numel() == 0:
+#             return x, mask
+#
+#             # 2. Get the tightest bounding box around the ACTUAL mass of the object
+#         y_min, y_max = valid_rows.min().item(), valid_rows.max().item()
+#         x_min, x_max = valid_cols.min().item(), valid_cols.max().item()
+#
+#         # 3. Add edge padding for context (Returning to your original 32 margin)
+#         margin = 32
+#         y_min, x_min = max(0, y_min - margin), max(0, x_min - margin)
+#         y_max, x_max = min(H, y_max + margin), min(W, x_max + margin)
+#
+#         crop_h, crop_w = y_max - y_min, x_max - x_min
+#
+#         # 4. Make dimensions divisible by 32 (Transformer requirement)
+#         def make_divisible(val, divisor=32):
+#             return (val + divisor - 1) // divisor * divisor
+#
+#         new_h, new_w = make_divisible(crop_h), make_divisible(crop_w)
+#         pad_h, pad_w = new_h - crop_h, new_w - crop_w
+#
+#         # 5. Crop and Pad
+#         cropped_img = x[:, :, y_min:y_max, x_min:x_max]
+#         cropped_mask = mask[:, :, y_min:y_max, x_min:x_max]
+#
+#         # Use reflect padding for image so borders look natural
+#         cropped_img_padded = F.pad(cropped_img, (0, pad_w, 0, pad_h), mode='reflect')
+#         cropped_mask_padded = F.pad(cropped_mask, (0, pad_w, 0, pad_h), mode='constant', value=0)
+#
+#         # 6. Run TransWeather on the crop
+#         cropped_input = torch.cat([cropped_img_padded, cropped_mask_padded], dim=1)
+#         restored_crop_padded = self.dehazer(cropped_input)
+#
+#         # 7. Un-pad to original crop size
+#         if pad_h > 0 or pad_w > 0:
+#             h_end = restored_crop_padded.shape[2] - pad_h
+#             w_end = restored_crop_padded.shape[3] - pad_w
+#             restored_crop = restored_crop_padded[:, :, :h_end, :w_end]
+#         else:
+#             restored_crop = restored_crop_padded
+#
+#         # 8. Paste back with soft blending
+#         out = x.clone()
+#         out[:, :, y_min:y_max, x_min:x_max] = (cropped_mask * restored_crop) + ((1.0 - cropped_mask) * cropped_img)
+#
+#         return out, mask
+
+
 class MaskedResidualTransWeather(nn.Module):
     """
-    Selective dehazing via residual gating.
-    Dehazing is applied only where the mask is high.
+    Selective dehazing via dynamic cropping.
+    1. Predicts object mask.
+    2. Crops to bounding box + padding.
+    3. Runs TransWeather ONLY on the crop.
+    4. Pastes the restored crop back into the full image.
     """
 
-    def __init__(self,mask_net):
+    def __init__(self, mask_net):
         super().__init__()
-
-        self.mask_net = mask_net         # REAL CNN (not dummy)
-        self.dehazer = Transweather()      # expects 4-channel input
+        self.mask_net = mask_net  # Lightweight U-Net
+        self.dehazer = Transweather()  # Expects 4-channel input (Image + Mask)
 
     def forward(self, x):
-        """
-        x: [B, 3, H, W] original hazy image
-        """
+        B, C, H, W = x.shape
 
-        # 1. Predict region-of-interest mask
-        mask = self.mask_net(x)            # [B, 1, H, W]
+        # 1. Predict mask for the whole batch at once (efficient)
+        mask = self.mask_net(x)  # [B, 1, H, W]
 
-        # 2. Append mask as 4th channel
-        x_masked = torch.cat([x, mask], dim=1)  # [B, 4, H, W]
+        # Prepare the output tensor
+        out = x.clone()
 
-        # 3. Dehaze (unchanged TransWeather)
-        dehazed = self.dehazer(x_masked)   # [B, 3, H, W]
+        # 2. Loop through the batch to handle varying crop sizes per image
+        for i in range(B):
+            # Extract single image and mask while keeping the batch dimension [1, C, H, W]
+            single_img = x[i:i + 1]
+            single_mask = mask[i:i + 1]
 
-        # 4. Residual gated fusion (KEY IDEA)
-        out = mask * dehazed + (1.0 - mask) * x
+            # --- TIGHTNESS FIX 1: Aggressive Threshold ---
+            binary_mask = (single_mask > 0.7).float()
+
+            # Now we safely look at the 0th index of our isolated single_mask
+            row_sums = torch.sum(binary_mask[0, 0], dim=1)  # Shape: [H]
+            col_sums = torch.sum(binary_mask[0, 0], dim=0)  # Shape: [W]
+
+            # --- TIGHTNESS FIX 2: Proportional Filter ---
+            noise_threshold_row = W * 0.02
+            noise_threshold_col = H * 0.02
+
+            valid_rows = torch.nonzero(row_sums > noise_threshold_row, as_tuple=False)
+            valid_cols = torch.nonzero(col_sums > noise_threshold_col, as_tuple=False)
+
+            # If nothing meaningful is found in THIS specific image, skip to the next one
+            if valid_rows.numel() == 0 or valid_cols.numel() == 0:
+                continue
+
+            # 3. Get the tightest bounding box
+            y_min, y_max = valid_rows.min().item(), valid_rows.max().item()
+            x_min, x_max = valid_cols.min().item(), valid_cols.max().item()
+
+            # 4. Add edge padding for context
+            margin = 32
+            y_min, x_min = max(0, y_min - margin), max(0, x_min - margin)
+            y_max, x_max = min(H, y_max + margin), min(W, x_max + margin)
+
+            crop_h, crop_w = y_max - y_min, x_max - x_min
+
+            # --- CRASH PREVENTION FIX ---
+            target_h = max(crop_h, 64)
+            target_w = max(crop_w, 64)
+
+            # 5. Make dimensions divisible by 32
+            def make_divisible(val, divisor=32):
+                return (val + divisor - 1) // divisor * divisor
+
+            new_h, new_w = make_divisible(target_h), make_divisible(target_w)
+            pad_h, pad_w = new_h - crop_h, new_w - crop_w
+
+            # 6. Crop and Pad
+            cropped_img = single_img[:, :, y_min:y_max, x_min:x_max]
+            cropped_mask = single_mask[:, :, y_min:y_max, x_min:x_max]
+
+            cropped_img_padded = F.pad(cropped_img, (0, pad_w, 0, pad_h), mode='replicate')
+            cropped_mask_padded = F.pad(cropped_mask, (0, pad_w, 0, pad_h), mode='constant', value=0)
+
+            # 7. Run TransWeather on the crop
+            cropped_input = torch.cat([cropped_img_padded, cropped_mask_padded], dim=1)
+            restored_crop_padded = self.dehazer(cropped_input)
+
+            # 8. Un-pad to original crop size
+            if pad_h > 0 or pad_w > 0:
+                h_end = restored_crop_padded.shape[2] - pad_h
+                w_end = restored_crop_padded.shape[3] - pad_w
+                restored_crop = restored_crop_padded[:, :, :h_end, :w_end]
+            else:
+                restored_crop = restored_crop_padded
+
+            # --- TIGHTNESS FIX 3: Strict Blending ---
+            strict_blend_mask = (cropped_mask > 0.5).float()
+
+            # 9. Paste back into the correct index of the output batch
+            out[i:i + 1, :, y_min:y_max, x_min:x_max] = (strict_blend_mask * restored_crop) + (
+                        (1.0 - strict_blend_mask) * cropped_img)
 
         return out, mask
-
 
 class MaskNet(nn.Module):
     """

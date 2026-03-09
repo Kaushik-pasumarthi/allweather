@@ -7,20 +7,28 @@ from PIL import ImageFile
 from os import path
 import numpy as np
 import torch
+
 ImageFile.LOAD_TRUNCATED_IMAGES = True
+import torchvision.transforms.functional as TF
+from torchvision import transforms
+import os
+
 
 # --- Training dataset --- #
 class TrainData(data.Dataset):
-    def __init__(self, crop_size, train_data_dir,train_filename):
+    def __init__(self, crop_size, train_data_dir, train_filename):
         super().__init__()
         train_list = train_data_dir + train_filename
         with open(train_list) as f:
             contents = f.readlines()
             input_names = [i.strip() for i in contents]
-            gt_names = [i.strip().replace('input','gt') for i in input_names]
+            gt_names = [i.strip().replace('input', 'gt') for i in input_names]
+            # NEW: Create mask paths
+            mask_names = [i.strip().replace('input', 'masks') for i in input_names]
 
         self.input_names = input_names
         self.gt_names = gt_names
+        self.mask_names = mask_names
         self.crop_size = crop_size
         self.train_data_dir = train_data_dir
 
@@ -28,46 +36,54 @@ class TrainData(data.Dataset):
         crop_width, crop_height = self.crop_size
         input_name = self.input_names[index]
         gt_name = self.gt_names[index]
+        mask_name = self.mask_names[index]
 
-        img_id = re.split('/',input_name)[-1][:-4]
+        img_id = re.split('/', input_name)[-1][:-4]
 
-        input_img = Image.open(self.train_data_dir + input_name)
+        input_img = Image.open(self.train_data_dir + input_name).convert('RGB')
+        gt_img = Image.open(self.train_data_dir + gt_name).convert('RGB')
 
-
-        try:
-            gt_img = Image.open(self.train_data_dir + gt_name)
-        except:
-            gt_img = Image.open(self.train_data_dir + gt_name).convert('RGB')
+        # NEW: Load the mask as grayscale ('L')
+        mask_img = Image.open(self.train_data_dir + mask_name).convert('L')
 
         width, height = input_img.size
 
-        if width < crop_width and height < crop_height :
-            input_img = input_img.resize((crop_width,crop_height), Image.ANTIALIAS)
+        # Resize logic applied to all three
+        if width < crop_width and height < crop_height:
+            input_img = input_img.resize((crop_width, crop_height), Image.ANTIALIAS)
             gt_img = gt_img.resize((crop_width, crop_height), Image.ANTIALIAS)
-        elif width < crop_width :
-            input_img = input_img.resize((crop_width,height), Image.ANTIALIAS)
-            gt_img = gt_img.resize((crop_width,height), Image.ANTIALIAS)
-        elif height < crop_height :
-            input_img = input_img.resize((width,crop_height), Image.ANTIALIAS)
+            mask_img = mask_img.resize((crop_width, crop_height), Image.ANTIALIAS)
+        elif width < crop_width:
+            input_img = input_img.resize((crop_width, height), Image.ANTIALIAS)
+            gt_img = gt_img.resize((crop_width, height), Image.ANTIALIAS)
+            mask_img = mask_img.resize((crop_width, height), Image.ANTIALIAS)
+        elif height < crop_height:
+            input_img = input_img.resize((width, crop_height), Image.ANTIALIAS)
             gt_img = gt_img.resize((width, crop_height), Image.ANTIALIAS)
+            mask_img = mask_img.resize((width, crop_height), Image.ANTIALIAS)
 
         width, height = input_img.size
 
+        # Generate exact same crop coordinates for all
         x, y = randrange(0, width - crop_width + 1), randrange(0, height - crop_height + 1)
+
         input_crop_img = input_img.crop((x, y, x + crop_width, y + crop_height))
         gt_crop_img = gt_img.crop((x, y, x + crop_width, y + crop_height))
+        mask_crop_img = mask_img.crop((x, y, x + crop_width, y + crop_height))  # NEW
 
         # --- Transform to tensor --- #
         transform_input = Compose([ToTensor(), Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
-        transform_gt = Compose([ToTensor()])
-        input_im = transform_input(input_crop_img)
-        gt = transform_gt(gt_crop_img)
+        transform_gt_mask = Compose([ToTensor()])  # Handles both GT and Mask
 
-        # --- Check the channel is 3 or not --- #
-        if list(input_im.shape)[0] is not 3 or list(gt.shape)[0] is not 3:
+        input_im = transform_input(input_crop_img)
+        gt = transform_gt_mask(gt_crop_img)
+        mask = transform_gt_mask(mask_crop_img)  # NEW: tensor of shape [1, H, W]
+
+        if list(input_im.shape)[0] != 3 or list(gt.shape)[0] != 3:
             raise Exception('Bad image channel: {}'.format(gt_name))
 
-        return input_im, gt, img_id
+        # NEW: Return the mask alongside everything else
+        return input_im, gt, mask, img_id
 
     def __getitem__(self, index):
         res = self.get_images(index)
@@ -76,85 +92,9 @@ class TrainData(data.Dataset):
     def __len__(self):
         return len(self.input_names)
 
-class TrainData_new(data.Dataset):
-    def __init__(self, crop_size, train_data_dir,train_filename):
-        super().__init__()
-        train_list = train_data_dir + train_filename
-        with open(train_list) as f:
-            contents = f.readlines()
-            input_names = [i.strip() for i in contents]
-            gt_names = [i.strip().replace('input','gt') for i in input_names]
 
-        self.input_names = input_names
-        self.gt_names = gt_names
-        self.crop_size = crop_size
-        self.train_data_dir = train_data_dir
-
-    def get_images(self, index):
-        crop_width, crop_height = self.crop_size
-        input_name = self.input_names[index]
-        gt_name = self.gt_names[index]
-        img_id = re.split('/',input_name)[-1][:-4]
-        
-        input_img = Image.open(self.train_data_dir + input_name)
-
-
-        try:
-            gt_img = Image.open(self.train_data_dir + gt_name)
-        except:
-            gt_img = Image.open(self.train_data_dir + gt_name).convert('RGB')
-
-        width, height = input_img.size
-        tmp_ch = 0
-
-        if width < crop_width and height < crop_height :
-            input_img = input_img.resize((crop_width,crop_height), Image.ANTIALIAS)
-            gt_img = gt_img.resize((crop_width, crop_height), Image.ANTIALIAS)
-        elif width < crop_width :
-            input_img = input_img.resize((crop_width,height), Image.ANTIALIAS)
-            gt_img = gt_img.resize((crop_width,height), Image.ANTIALIAS)
-        elif height < crop_height :
-            input_img = input_img.resize((width,crop_height), Image.ANTIALIAS)
-            gt_img = gt_img.resize((width, crop_height), Image.ANTIALIAS)
-
-        width, height = input_img.size
-        # --- x,y coordinate of left-top corner --- #
-        x, y = randrange(0, width - crop_width + 1), randrange(0, height - crop_height + 1)
-        input_crop_img = input_img.crop((x, y, x + crop_width, y + crop_height))
-
-        # --- Transform to tensor --- #
-        transform_input = Compose([ToTensor(), Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
-        transform_gt = Compose([ToTensor()])
-
-        input_im = transform_input(input_crop_img)
-        gt = transform_gt(gt_crop_img)
-
-        
-        # --- Check the channel is 3 or not --- #
-        # print(input_im.shape)
-        if list(input_im.shape)[0] is not 3 or list(gt.shape)[0] is not 3:
-            raise Exception('Bad image channel: {}'.format(gt_name))
-
-
-        return input_im, gt, img_id,R_map,trans_map
-
-    def __getitem__(self, index):
-        res = self.get_images(index)
-        return res
-
-    def __len__(self):
-        return len(self.input_names)
-
-from torch.utils.data import Dataset
-
-import os
-
-from torch.utils.data import Dataset
-import os
-import torchvision.transforms.functional as TF
-from torchvision import transforms
-
-class AllWeatherDataset(Dataset):
+# --- All Weather Dataset (The cleaner one) --- #
+class AllWeatherDataset(data.Dataset):
     def __init__(self, root, file_list, crop_size, train=True):
         self.root = root
         self.crop_size = crop_size
@@ -170,12 +110,14 @@ class AllWeatherDataset(Dataset):
         inp_rel = self.input_files[idx].replace('./allweather/', '')
 
         inp_path = os.path.join(self.root, inp_rel)
-        gt_path  = inp_path.replace('input', 'gt')
+        gt_path = inp_path.replace('input', 'gt')
+        mask_path = inp_path.replace('input', 'masks')  # NEW: Target the masks folder
 
         inp = Image.open(inp_path).convert('RGB')
-        gt  = Image.open(gt_path).convert('RGB')
+        gt = Image.open(gt_path).convert('RGB')
+        mask = Image.open(mask_path).convert('L')  # NEW: Load mask in Grayscale
 
-        # -------- STEP 4 IS HERE -------- #
+        # -------- EXACT MATCH CROPPING -------- #
         if self.train:
             i, j, h, w = transforms.RandomCrop.get_params(inp, self.crop_size)
         else:
@@ -183,12 +125,16 @@ class AllWeatherDataset(Dataset):
             th, tw = self.crop_size
             i = (h_img - th) // 2
             j = (w_img - tw) // 2
-            h,w=th,tw
+            h, w = th, tw
+
         inp = TF.crop(inp, i, j, h, w)
-        gt  = TF.crop(gt, i, j, h, w)
-        # -------------------------------- #
+        gt = TF.crop(gt, i, j, h, w)
+        mask = TF.crop(mask, i, j, h, w)  # NEW: Crop mask exactly the same way
+        # -------------------------------------- #
 
         inp = TF.to_tensor(inp)
-        gt  = TF.to_tensor(gt)
+        gt = TF.to_tensor(gt)
+        mask = TF.to_tensor(mask)  # NEW
 
-        return inp, gt, inp_rel
+        # NEW: Return mask
+        return inp, gt, mask, inp_rel

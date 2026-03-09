@@ -6,3 +6,7 @@ masked_baseline/latest.pth
 /masked_baseline/
 /base_transweather_5ep/best
 /base_transweather_5ep/latest
+/allweather
+/selective_run_01
+/selective_run_02
+/selective_run_03
